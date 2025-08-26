@@ -1,0 +1,452 @@
+import tkinter as tk
+from tkinter import messagebox
+import customtkinter as ctk
+import threading
+import queue
+import requests
+import pandas as pd
+import os
+import time
+import json
+from datetime import datetime
+import sys
+
+# --- Проверка и импорт зависимостей ---
+try:
+    import openpyxl
+    from openpyxl.styles import PatternFill
+    from openpyxl.utils import get_column_letter
+except ImportError:
+    messagebox.showerror("Ошибка импорта", "Требуется библиотека openpyxl. Установите ее: pip install openpyxl")
+    sys.exit(1)
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except ImportError:
+    messagebox.showerror("Ошибка импорта", "Требуются библиотеки gspread и google-auth-oauthlib. Установите их: pip install gspread google-auth-oauthlib")
+    sys.exit(1)
+
+# --- Функция для "умного" поиска файлов ---
+def resource_path(relative_path):
+    """ Находит абсолютный путь к ресурсу, работает и для скрипта, и для .exe """
+    try:
+        # PyInstaller создает временную папку и сохраняет путь в _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+# --- Глобальные настройки ---
+CONFIG_FILE = resource_path('config_k2.json')
+CREDENTIALS_FILE = resource_path('credentials.json')
+CONFIG = {}
+RED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+YELLOW_FILL = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+GREEN_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+
+# --- Логика для работы с API и данными (Backend) ---
+class BackendLogic:
+    def __init__(self, logger_queue):
+        self.logger_queue = logger_queue
+
+    def log(self, message):
+        self.logger_queue.put(message)
+
+    def load_config(self):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                global CONFIG
+                CONFIG = json.load(f)
+                self.log(f"✓ Конфигурация успешно загружена.")
+                return True
+        except FileNotFoundError:
+            self.log(f"КРИТИЧЕСКАЯ ОШИБКА: Файл конфигурации '{os.path.basename(CONFIG_FILE)}' не найден.")
+            return False
+        except json.JSONDecodeError:
+            self.log(f"КРИТИЧЕСКАЯ ОШИБКА: Неверный формат JSON в файле конфигурации.")
+            return False
+
+    def get_status_by_thresholds(self, current_value, thresholds):
+        if not thresholds: return "НЕТ ДАННЫХ", 0, None
+        val_100, val_95, val_85 = thresholds.get('100%'), thresholds.get('95%'), thresholds.get('85%')
+        if val_100 is None or val_95 is None: return "НЕТ ДАННЫХ", 0, None
+        if val_85 is None: val_85 = val_100 * 0.85
+        percentage = (current_value / val_100 * 100) if val_100 > 0 else 0
+        if current_value >= val_95: return "🔴 КРИТИЧЕСКИЙ УРОВЕНЬ", percentage, RED_FILL
+        if current_value >= val_85: return "🟡 ВЫСОКАЯ ЗАГРУЗКА", percentage, YELLOW_FILL
+        return "🟢 СВОБОДНО", percentage, GREEN_FILL
+
+    def login_and_get_token(self, session, url, username, password):
+        self.log("Отправка запроса на авторизацию...")
+        try:
+            response = session.post(url, json={'phone_number': username, 'password': password}, timeout=15)
+            response.raise_for_status()
+            access_token = response.json().get('data', {}).get('access_token')
+            if not access_token: raise ValueError("Токен не получен в ответе API.")
+            self.log("✓ Авторизация прошла успешно!")
+            return access_token
+        except Exception as e:
+            self.log(f"✗ Ошибка авторизации: {e}")
+            raise
+
+    def download_and_process_data(self, session, token):
+        all_data_dfs = []
+        data_url = CONFIG['api_settings']['data_url']
+        headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+        for warehouse in CONFIG['warehouses_to_process']:
+            self.log(f"\n--- Скачивание данных для склада: {warehouse['name']} (ID: {warehouse['id']}) ---")
+            for floor in warehouse['floors_to_process']:
+                for row_num in warehouse.get('rows_to_process', []):
+                    try:
+                        payload = {'wh_id': warehouse['id'], 'stage': floor, 'street': row_num}
+                        self.log(f"  Запрос: Этаж {floor}, Ряд {row_num}...")
+                        response = session.post(data_url, json=payload, headers=headers, timeout=20)
+                        response.raise_for_status()
+                        data = response.json()
+                        if data and isinstance(data, list):
+                            df = pd.DataFrame(data)
+                            df['floor'], df['row_num'] = floor, row_num
+                            all_data_dfs.append(df)
+                            self.log(f"  ✓ Запрос: Этаж {floor}, Ряд {row_num}... Получено {len(data)} строк.")
+                        else:
+                            self.log(f"  ✓ Запрос: Этаж {floor}, Ряд {row_num}... Пусто.")
+                    except Exception as e:
+                        self.log(f"  ✗ Ошибка при запросе (Этаж {floor}, Ряд {row_num}): {e}")
+                    time.sleep(0.1)
+        return pd.concat(all_data_dfs, ignore_index=True) if all_data_dfs else pd.DataFrame()
+
+    def analyze_data(self, full_df):
+        if full_df.empty:
+            self.log("Нет данных для анализа.")
+            return {}, []
+        self.log("\nАнализ полученных данных...")
+        category_data = {}
+        row_data = []
+        
+        full_df.columns = [str(c).strip().lower() for c in full_df.columns]
+        qty_col, box_id_col, place_col = 'qty', 'box_id', 'place_name'
+        
+        if qty_col not in full_df.columns:
+            self.log(f"Критическая ошибка: не найдена колонка '{qty_col}'.")
+            return {}, []
+        
+        full_df[qty_col] = pd.to_numeric(full_df[qty_col], errors='coerce').fillna(0).astype(int)
+        if box_id_col in full_df.columns:
+            full_df[box_id_col] = pd.to_numeric(full_df[box_id_col], errors='coerce').fillna(0).astype(int)
+        else:
+            full_df[box_id_col] = 0
+            
+        if place_col in full_df.columns:
+            full_df[place_col] = full_df[place_col].astype(str)
+        else:
+            full_df[place_col] = ""
+
+        for floor, floor_df in full_df.groupby('floor'):
+            category_data.setdefault(floor, {})
+            
+            if floor == 1:
+                floor_config = CONFIG.get('fill_thresholds_per_floor', {}).get(str(floor), {})
+                for cat_name in floor_config:
+                    if cat_name != "Общее":
+                        if cat_name == "КГТ":
+                             category_data[floor][cat_name] = {'Общее': 0}
+                        else:
+                             category_data[floor][cat_name] = {'СГТ': 0, 'МГТ': 0}
+                category_data[floor].setdefault('Неопределенная категория', {'Общее': 0})
+
+                for _, row in floor_df.iterrows():
+                    qty = row[qty_col]
+                    box_id = row[box_id_col]
+                    place_str = row[place_col]
+                    row_num = row['row_num']
+                    stellazh = -1
+                    
+                    try:
+                        clean_place = place_str.replace("КЗ201.", "", 1) if place_str.startswith("КЗ201.") else place_str.replace("КЗ2.", "", 1)
+                        parts = clean_place.split('.')
+                        if len(parts) >= 3:
+                            stellazh = int(parts[2])
+                    except (ValueError, IndexError):
+                        pass
+                    
+                    final_category = "Неопределенная категория"
+                    if 0 <= row_num <= 27 or row_num == 62:
+                        final_category = "КГТ"
+                    elif 28 <= row_num <= 61:
+                        if 47 <= row_num <= 48:
+                            final_category = "Косметика"
+                        elif 1 <= stellazh <= 98:
+                            final_category = "Косметика"
+                        elif 105 <= stellazh <= 208:
+                            final_category = "Химия"
+                    
+                    if final_category in category_data[floor]:
+                        if final_category == "КГТ":
+                            category_data[floor][final_category]['Общее'] += qty
+                        else:
+                            category_data[floor][final_category]['СГТ' if box_id == 0 else 'МГТ'] += qty
+                    else:
+                        category_data[floor]['Неопределенная категория']['Общее'] += qty
+            else:
+                category_data[floor].setdefault('Полочный товар', {'Общее': 0})
+                category_data[floor].setdefault('Коробочный товар', {'Общее': 0})
+                
+                shelf_goods = floor_df[floor_df[box_id_col] == 0][qty_col].sum()
+                box_goods = floor_df[floor_df[box_id_col] != 0][qty_col].sum()
+                
+                category_data[floor]['Полочный товар']['Общее'] = shelf_goods
+                category_data[floor]['Коробочный товар']['Общее'] = box_goods
+        
+        row_summary = full_df.groupby(['floor', 'row_num'])[qty_col].sum().reset_index()
+        for _, row in row_summary.iterrows():
+            floor_val = int(row['floor'])
+            row_num_val = int(row['row_num'])
+            current_total_row = row[qty_col]
+            
+            row_thresholds = CONFIG.get('fill_thresholds_per_row', {}).get(str(floor_val), {}).get(str(row_num_val))
+            
+            if row_thresholds:
+                row_status, row_percent, row_color = self.get_status_by_thresholds(current_total_row, row_thresholds)
+                items_to_95 = max(0, int(row_thresholds.get('95%', 0) - current_total_row))
+                row_data.append({
+                    'Этаж': floor_val, 
+                    'Ряд': row_num_val, 
+                    'Фактическое кол-во ШК': current_total_row, 
+                    'Макс. вместимость (100%)': row_thresholds.get('100%'), 
+                    '% заполнения': row_percent, 
+                    'Осталось ШК до 95%': items_to_95, 
+                    'Статус': row_status, 
+                    'Цвет': row_color
+                })
+        return category_data, row_data
+
+    def generate_reports(self, report_name, category_data, row_data):
+        txt_filename = f'summary_report_{report_name}_{datetime.now().strftime("%Y-%m-%d")}.txt'
+        report_lines = ["*" * 60, f"Сводный отчет по категориям ({datetime.now().strftime('%Y-%m-%d %H:%M')})", "*" * 60 + "\n"]
+        
+        grand_total = 0
+        for floor_data in category_data.values():
+            for cat_data in floor_data.values():
+                grand_total += sum(cat_data.values())
+
+        wh_thresholds = CONFIG.get('fill_thresholds_per_floor', {}).get('Общая_Площадка', {}).get('Общее')
+        wh_status, wh_percent, _ = self.get_status_by_thresholds(grand_total, wh_thresholds)
+        report_lines.extend([
+            "--- ОБЩАЯ ЗАПОЛНЕННОСТЬ СКЛАДА ---",
+            f"  > Всего товаров: {grand_total:,.0f} шт.".replace(',', ' '),
+            f"  > СТАТУС: {wh_status} ({wh_percent:.1f}%)\n",
+            "--- ДЕТАЛИЗАЦИЯ ПО ЭТАЖАМ И КАТЕГОРИЯМ ---"
+        ])
+
+        for floor, floor_data in sorted(category_data.items()):
+            total_floor = 0
+            for cat_data in floor_data.values():
+                total_floor += sum(cat_data.values())
+            
+            floor_thresholds = CONFIG.get('fill_thresholds_per_floor', {}).get(str(floor), {}).get('Общее')
+            floor_status, floor_percent, _ = self.get_status_by_thresholds(total_floor, floor_thresholds)
+            report_lines.append(f"\n## ЭТАЖ {floor} (Всего: {total_floor:,.0f} шт. | СТАТУС: {floor_status} ({floor_percent:.1f}%))".replace(',', ' '))
+            
+            for category, cat_data in sorted(floor_data.items()):
+                if category == 'Неопределенная категория' and sum(cat_data.values()) == 0:
+                    continue
+                
+                cat_total = sum(cat_data.values())
+                cat_thresholds = CONFIG.get('fill_thresholds_per_floor', {}).get(str(floor), {}).get(category)
+                cat_status, cat_percent, _ = self.get_status_by_thresholds(cat_total, cat_thresholds)
+                report_lines.append(f"  - Категория: {category} (Всего: {cat_total:,.0f} шт.) - СТАТУС: {cat_status} ({cat_percent:.1f}%)".replace(',', ' '))
+                
+                if 'СГТ' in cat_data:
+                    report_lines.append(f"    - СГТ: {cat_data.get('СГТ', 0):,.0f} шт.".replace(',', ' '))
+                    report_lines.append(f"    - МГТ: {cat_data.get('МГТ', 0):,.0f} шт.".replace(',', ' '))
+        
+        final_report_text = "\n".join(report_lines)
+        self.log("\n" + final_report_text)
+        
+        try:
+            with open(txt_filename, 'w', encoding='utf-8') as f:
+                f.write(final_report_text)
+            self.log(f"\n✓ Текстовый отчет сохранен: {txt_filename}")
+        except Exception as e:
+            self.log(f"✗ Не удалось сохранить текстовый отчет: {e}")
+            
+        if not row_data:
+            self.log("Нет данных для создания Excel отчета.")
+            return
+            
+        excel_filename = f'detailed_report_{report_name}_{datetime.now().strftime("%Y-%m-%d")}.xlsx'
+        df = pd.DataFrame(row_data)
+        df.sort_values(by=['Этаж', 'Ряд'], inplace=True)
+        
+        try:
+            with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
+                for floor_num, floor_df in df.groupby('Этаж'):
+                    sheet_name = f"Этаж {floor_num}"
+                    display_cols = ['Ряд', 'Макс. вместимость (100%)', 'Фактическое кол-во ШК', '% заполнения', 'Осталось ШК до 95%', 'Статус']
+                    final_df = floor_df.reindex(columns=display_cols).fillna('N/A')
+                    final_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    ws = writer.sheets[sheet_name]
+                    
+                    for r_idx, row in floor_df.iterrows():
+                        if 'Цвет' in row and row['Цвет']:
+                            excel_row_index = ws.max_row - len(floor_df) + (r_idx - floor_df.index[0]) + 1
+                            if excel_row_index <= ws.max_row:
+                                for cell in ws[excel_row_index]:
+                                    cell.fill = row['Цвет']
+                                    
+                    for i, col_name in enumerate(final_df.columns):
+                        max_length = max(final_df[col_name].astype(str).map(len).max(), len(col_name))
+                        ws.column_dimensions[get_column_letter(i + 1)].width = max_length + 2
+            self.log(f"✓ Excel-отчет сохранен: {excel_filename}\n")
+        except Exception as e:
+            self.log(f"✗ Не удалось сохранить Excel-отчет: {e}")
+
+    def upload_to_gsheets(self, row_data):
+        g_settings = CONFIG.get('google_sheets_settings')
+        if not g_settings or not g_settings.get('sheet_id'):
+            self.log("ID таблицы Google Sheets не указан в конфигурации.")
+            return
+            
+        self.log("\n" + "-" * 20 + " ВЫГРУЗКА В GOOGLE SHEETS " + "-" * 20)
+        df = pd.DataFrame(row_data)
+        if df.empty:
+            self.log("Нет данных для выгрузки в Google Sheets.")
+            return
+            
+        df = df.drop(columns=['Цвет'], errors='ignore')
+        for floor_num, floor_df in df.groupby('Этаж'):
+            if floor_df.empty:
+                self.log(f"Нет данных для выгрузки на Этаж {floor_num}.")
+                continue
+                
+            display_df = floor_df.copy()
+            if '% заполнения' in display_df.columns:
+                display_df['% заполнения'] = display_df['% заполнения'].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "N/A")
+                
+            cols_order = ['Ряд', 'Макс. вместимость (100%)', 'Фактическое кол-во ШК', '% заполнения', 'Осталось ШК до 95%', 'Статус']
+            final_df = display_df.reindex(columns=cols_order).fillna('N/A')
+            worksheet_name = f"Этаж {floor_num}"
+            
+            try:
+                scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+                creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
+                gc = gspread.authorize(creds)
+                sh = gc.open_by_key(g_settings['sheet_id'])
+                
+                try:
+                    worksheet = sh.worksheet(worksheet_name)
+                    worksheet.clear()
+                    self.log(f"Очищен существующий лист '{worksheet_name}'.")
+                except gspread.exceptions.WorksheetNotFound:
+                    worksheet = sh.add_worksheet(title=worksheet_name, rows=len(final_df) + 1, cols=len(final_df.columns))
+                    self.log(f"Создан новый лист '{worksheet_name}'.")
+                    
+                worksheet.update([final_df.columns.values.tolist()] + final_df.astype(str).values.tolist(), value_input_option='USER_ENTERED')
+                self.log(f"✓ Данные записаны на вкладку '{worksheet_name}'")
+            except Exception as e:
+                self.log(f"✗ Ошибка выгрузки в Google Sheets ({worksheet_name}): {e}")
+
+    def run_main_logic(self, username, password):
+        if not self.load_config():
+            return
+        try:
+            with requests.Session() as session:
+                token = self.login_and_get_token(session, CONFIG['api_settings']['login_url'], username, password)
+                if not token:
+                    return
+                full_df = self.download_and_process_data(session, token)
+                
+            category_data, row_data = self.analyze_data(full_df)
+            
+            if category_data or row_data:
+                config_name = os.path.splitext(os.path.basename(CONFIG_FILE))[0]
+                final_report_name = f"Сводный_Отчет_{config_name}"
+                self.log("\n" + "=" * 60 + "\nГЕНЕРАЦИЯ СВОДНЫХ ОТЧЕТОВ\n" + "=" * 60)
+                self.generate_reports(final_report_name, category_data, row_data)
+                self.upload_to_gsheets(row_data)
+            else:
+                self.log("Нет данных для создания отчетов.")
+                
+            self.log("\n\nРабота скрипта полностью завершена.")
+        except Exception as e:
+            self.log(f"\nКРИТИЧЕСКАЯ ОШИБКА: {e}")
+
+# --- Графический интерфейс (Frontend) на CustomTkinter ---
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        
+        self.title("K2 Report Generator")
+        self.geometry("420x600")
+        self.resizable(False, False)
+        self.configure(fg_color="#1a1a1a")
+
+        main_frame = ctk.CTkFrame(self, fg_color="#2b2b2b", corner_radius=15)
+        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        
+        logo_label = ctk.CTkLabel(main_frame, text="K2", font=ctk.CTkFont(family="Segoe UI", size=32, weight="bold"), text_color="white")
+        logo_label.pack(pady=(20, 15))
+        
+        self.phone_entry = ctk.CTkEntry(main_frame, placeholder_text="Phone Number", font=ctk.CTkFont(family="Segoe UI", size=13), height=40, border_width=0, corner_radius=8, fg_color="#3c3c3c")
+        self.phone_entry.pack(pady=7, padx=30, fill='x')
+
+        self.password_entry = ctk.CTkEntry(main_frame, placeholder_text="Password", show="*", font=ctk.CTkFont(family="Segoe UI", size=13), height=40, border_width=0, corner_radius=8, fg_color="#3c3c3c")
+        self.password_entry.pack(pady=7, padx=30, fill='x')
+        
+        log_title = ctk.CTkLabel(main_frame, text="Logs", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color="#b0b0b0")
+        log_title.pack(pady=(20, 5), padx=30, anchor="w")
+        
+        self.log_text = ctk.CTkTextbox(main_frame, activate_scrollbars=True, corner_radius=8, fg_color="#1c1c1c", text_color="#d0d0d0", font=ctk.CTkFont(family="Consolas", size=9), border_width=0)
+        self.log_text.pack(pady=5, padx=30, fill='both', expand=True)
+        self.log_text.configure(state="disabled")
+
+        self.run_button = ctk.CTkButton(main_frame, text="Run Report", font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"), height=50, corner_radius=10, fg_color="#8e2de2", hover_color="#4a00e0", command=self.start_report_thread)
+        self.run_button.pack(pady=20, padx=30, fill='x')
+        
+        self.log_queue = queue.Queue()
+        self.backend = BackendLogic(self.log_queue)
+        self.after(100, self.process_log_queue)
+
+    def log_message(self, message):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", message + "\n")
+        self.log_text.configure(state="disabled")
+        self.log_text.yview_moveto(1.0)
+
+    def process_log_queue(self):
+        try:
+            while True:
+                self.log_message(self.log_queue.get_nowait())
+        except queue.Empty:
+            pass
+        self.after(100, self.process_log_queue)
+
+    def start_report_thread(self):
+        username = self.phone_entry.get()
+        password = self.password_entry.get()
+        if not username or not password:
+            messagebox.showwarning("Внимание", "Пожалуйста, введите номер телефона и пароль.")
+            return
+
+        self.run_button.configure(state="disabled", text="Выполняется...")
+        self.log_text.configure(state="normal")
+        self.log_text.delete('1.0', "end")
+        self.log_text.configure(state="disabled")
+        
+        self.thread = threading.Thread(target=self.backend.run_main_logic, args=(username, password))
+        self.thread.daemon = True
+        self.thread.start()
+        self.after(100, self.check_thread)
+
+    def check_thread(self):
+        if self.thread.is_alive():
+            self.after(100, self.check_thread)
+        else:
+            self.run_button.configure(state="normal", text="Run Report")
+            messagebox.showinfo("Завершено", "Процесс создания отчета полностью завершен!")
+
+if __name__ == "__main__":
+    ctk.set_appearance_mode("dark")
+    app = App()
+    app.mainloop()
+
